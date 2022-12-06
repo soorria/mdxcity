@@ -7,8 +7,8 @@ const Home: NextPage = () => {
       <Head>
         <title>MDX City</title>
       </Head>
-      <main className="flex min-h-screen flex-col items-center justify-center">
-        MDX City
+      <main className="flex min-h-screen flex-col items-center justify-center text-center">
+        MDX City. <br /> In Production.
       </main>
     </>
   );
