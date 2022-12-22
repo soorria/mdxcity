@@ -5,7 +5,12 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { useEditor, EditorContent, type JSONContent } from "@tiptap/react";
+import {
+  useEditor,
+  EditorContent,
+  type Editor,
+  type JSONContent,
+} from "@tiptap/react";
 import produce from "immer";
 import cuid from "cuid";
 import StarterKit from "@tiptap/starter-kit";
@@ -49,6 +54,11 @@ const Block: React.FC<{
   value: JSONContent | string;
   onChange?: (value: JSONContent) => void;
   onAdd?: () => void;
+  onDelete?: () => void;
+  onEditorSetup?: (editor: Editor) => void;
+  onEditorCleanup?: () => void;
+  onSplit?: () => void;
+  onMerge?: (direction: "before" | "after") => void;
 }> = (props) => {
   const editor = useEditor({
     extensions: [
@@ -72,26 +82,85 @@ const Block: React.FC<{
   const sortable = useSortable({ id: props.id });
 
   const onChange = useStableFn(props.onChange);
+  const onAdd = useStableFn(props.onAdd);
+  const onSplit = useStableFn(props.onSplit);
+  const onDelete = useStableFn(props.onDelete);
+  const onMerge = useStableFn(props.onMerge);
+  const onEditorSetup = useStableFn(props.onEditorSetup);
+  const onEditorCleanup = useStableFn(props.onEditorCleanup);
 
   useEffect(() => {
     if (!editor) return;
 
-    editor.view.dom.addEventListener(
-      "keydown",
-      (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          event.stopPropagation();
+    onEditorSetup(editor);
+    const onKeydown = (event: KeyboardEvent) => {
+      const stopEvent = () => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        event.stopPropagation();
+      };
+      // event.persist();
+
+      if (event.key === "Enter" && !event.shiftKey) {
+        stopEvent();
+
+        if (event.ctrlKey || event.metaKey || event.altKey) {
+          return;
         }
-      },
-      { capture: true }
-    );
+
+        onSplit();
+      }
+
+      if (event.key === "Backspace") {
+        if (editor.isEmpty) {
+          stopEvent();
+          onDelete();
+          return;
+        }
+
+        // TODO: if not empty, and at start of line, merge with prev
+        if (editor.state.selection.$head.pos <= 1) {
+          console.log("hi");
+          onMerge("before");
+          stopEvent();
+          return;
+        }
+      }
+
+      if (event.key === "Delete") {
+        // TODO:at END of line, merge next into current
+        if (
+          event.target &&
+          editor.state.selection.$head.pos >
+            ((event.target as HTMLElement).textContent?.length ?? 0)
+        ) {
+          onMerge("after");
+          stopEvent();
+          return;
+        }
+      }
+    };
+    const dom = editor.view.dom;
+
+    dom.addEventListener("keydown", onKeydown, { capture: true });
 
     editor.on("update", ({ editor }) => {
       onChange(editor.getJSON());
     });
-  }, [editor, onChange]);
+
+    return () => {
+      onEditorCleanup();
+      dom.removeEventListener("keydown", onKeydown, { capture: true });
+    };
+  }, [
+    editor,
+    onChange,
+    onSplit,
+    onEditorSetup,
+    onEditorCleanup,
+    onDelete,
+    onMerge,
+  ]);
 
   return (
     <div
@@ -105,7 +174,7 @@ const Block: React.FC<{
     >
       <div className="absolute -left-1 top-0 flex -translate-x-full gap-1 opacity-100 group-hocus:opacity-100">
         <button
-          onClick={() => props.onAdd?.()}
+          onClick={() => onAdd()}
           className="rounded p-1 text-sm transition-colors hocus:bg-gray-200"
         >
           +
@@ -122,30 +191,52 @@ const Block: React.FC<{
   );
 };
 
+type Block = {
+  // TODO: discriminated union to handle diff types
+  content: JSONContent;
+};
+
 type Doc = {
   // TODO: discriminated union to handle diff types
   // type: "mdx" | "blocks";
   title: string;
   blocks: {
     order: string[];
-    data: Record<
-      string,
-      {
-        // TODO: discriminated union to handle diff types
-        content: JSONContent | string;
-      }
-    >;
+    data: Record<string, Block>;
   };
 };
 
-const defaultBlock = () => {
+const defaultBlock = (): [string, Block] => {
   const blockId = cuid();
   return [
     blockId,
     {
-      content: `<p>Type here to get started! (id: ${blockId})</p>`,
+      content: {
+        type: "doc",
+        content: [
+          {
+            type: "paragraph",
+            content: [
+              { type: "text", text: `type here to get started (${blockId})` },
+            ],
+          },
+        ],
+      },
     },
-  ] as const;
+  ];
+};
+
+const blockFromContent = (content: JSONContent[]): [string, Block] => {
+  const blockId = cuid();
+  return [
+    blockId,
+    {
+      content: {
+        type: "doc",
+        content,
+      },
+    },
+  ];
 };
 
 const initialDoc: Doc = (() => {
@@ -164,6 +255,7 @@ const initialDoc: Doc = (() => {
 
 const Playground: React.FC = () => {
   const [doc, setDoc] = useState<Doc>(initialDoc);
+  const editors = useRef<Record<string, Editor>>({});
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -171,7 +263,39 @@ const Playground: React.FC = () => {
       coordinateGetter: sortableKeyboardCoordinates,
     })
   );
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const [draggingId, setDraggingeId] = useState<string | null>(null);
+
+  console.log(doc);
+
+  const insertNewBlock = (idx: number) => {
+    const [newBlockId, newBlock] = defaultBlock();
+    setDoc(
+      produce((draft) => {
+        draft.blocks.data[newBlockId] = newBlock;
+        draft.blocks.order.splice(idx, 0, newBlockId);
+      })
+    );
+  };
+
+  const focusBlock = (
+    id: string,
+    position: "front" | "back" | "none" = "none"
+  ) => {
+    setTimeout(() => {
+      const editor = editors.current[id];
+      if (!editor || editor.isFocused) return;
+      console.log("focussing");
+      const chain = editor?.chain().focus();
+
+      if (position === "front") {
+        chain.selectTextblockStart();
+      } else if (position === "back") {
+        chain.selectTextblockEnd();
+      }
+
+      chain.run();
+    }, 10);
+  };
 
   return (
     <div className="mx-auto max-w-screen-lg p-8">
@@ -180,7 +304,7 @@ const Playground: React.FC = () => {
         collisionDetection={closestCenter}
         onDragStart={({ active }) => {
           if (!active) return;
-          setActiveId(active.id as string);
+          setDraggingeId(active.id as string);
         }}
         onDragEnd={({ active, over }) => {
           if (!over) return;
@@ -221,13 +345,98 @@ const Playground: React.FC = () => {
                     );
                   }}
                   onAdd={() => {
-                    const [newBlockId, newBlock] = defaultBlock();
+                    insertNewBlock(blockIdx + 1);
+                  }}
+                  onSplit={() => {
+                    const editor = editors.current[id];
+                    editor.commands.enter();
+                    const blockJson = editor.getJSON();
+                    const newBlockContent =
+                      blockJson.content?.splice(1, 1) || [];
+                    editor.commands.setContent(blockJson);
                     setDoc(
                       produce((draft) => {
+                        draft.blocks.data[id].content = blockJson;
+                        const [newBlockId, newBlock] =
+                          blockFromContent(newBlockContent);
                         draft.blocks.data[newBlockId] = newBlock;
                         draft.blocks.order.splice(blockIdx + 1, 0, newBlockId);
+                        focusBlock(newBlockId);
                       })
                     );
+                  }}
+                  onDelete={() => {
+                    setDoc(
+                      produce((draft) => {
+                        draft.blocks.order.splice(blockIdx, 1);
+                        delete draft.blocks.data[id];
+                      })
+                    );
+                    const blockIndexToFocus = blockIdx >= 1 ? blockIdx - 1 : 0;
+                    const blockIdToFocus = doc.blocks.order[blockIndexToFocus];
+                    if (blockIdToFocus) focusBlock(blockIdToFocus);
+                  }}
+                  onMerge={async (direction) => {
+                    if (direction === "before") {
+                      if (blockIdx <= 0) return;
+                      const currEditor = editors.current[id];
+                      const prevId = doc.blocks.order[blockIdx - 1];
+                      const prevEditor = editors.current[prevId];
+
+                      console.log(currEditor.getHTML(), currEditor.getText());
+
+                      const text = currEditor.getText();
+
+                      // probably a smarter way to do with with `joinUp`
+                      prevEditor.chain().focus().selectTextblockEnd().run();
+                      const selection = prevEditor.state.selection.$head.pos;
+                      prevEditor
+                        .chain()
+                        .insertContent(text)
+                        .setTextSelection(selection)
+                        .run();
+
+                      setDoc(
+                        produce((draft) => {
+                          draft.blocks.order.splice(blockIdx, 1);
+                          delete draft.blocks.data[id];
+                        })
+                      );
+                    } else {
+                      if (blockIdx >= doc.blocks.order.length - 1) {
+                        return;
+                      }
+                      const currEditor = editors.current[id];
+                      const nextIdx = blockIdx + 1;
+                      const nextId = doc.blocks.order[nextIdx];
+                      const nextEditor = editors.current[nextId];
+
+                      console.log(currEditor.getHTML(), currEditor.getText());
+
+                      const text = currEditor.getText();
+
+                      // probably a smarter way to do with with `joinUp`
+                      currEditor.chain().focus().selectTextblockEnd().run();
+                      const selection = currEditor.state.selection.$head.pos;
+                      currEditor
+                        .chain()
+                        .insertContent(text)
+                        .setTextSelection(selection)
+                        .run();
+
+                      setDoc(
+                        produce((draft) => {
+                          draft.blocks.order.splice(nextIdx, 1);
+                          delete draft.blocks.data[nextId];
+                        })
+                      );
+                    }
+                  }}
+                  onEditorSetup={(editor) => {
+                    editors.current[id] = editor;
+                  }}
+                  onEditorCleanup={() => {
+                    delete editors.current[id];
                   }}
                 />
               );
